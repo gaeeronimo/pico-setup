@@ -3,8 +3,21 @@
 # Exit on error
 set -e
 
+INSTALL_DEPENDENCIES="STD"
+SUDO="sudo"
+
 if grep -q Raspberry /proc/cpuinfo; then
     echo "Running on a Raspberry Pi"
+elif [[ "$MSYSTEM" == "MINGW64" ]]; then
+    echo "Running in minGW64"
+    INSTALL_DEPENDENCIES="MINGW64"
+    # TODO: Install vscode & putty from this script?
+    SKIP_VSCODE=1
+    SKIP_UART=1
+    SUDO=""
+elif [[ "$MSYSTEM" == "MSYS" ]] || [[ "$MSYSTEM" == "MINGW32" ]]; then
+    echo "Run setup in a MINGW64 shell, please!"
+    exit 1
 else
     echo "Not running on a Raspberry Pi. Use at your own risk!"
 fi
@@ -16,31 +29,74 @@ JNUM=4
 OUTDIR="$(pwd)/pico"
 
 # Install dependencies
-GIT_DEPS="git"
-SDK_DEPS="cmake gcc-arm-none-eabi gcc g++"
-OPENOCD_DEPS="gdb-multiarch automake autoconf build-essential texinfo libtool libftdi-dev libusb-1.0-0-dev"
-# Wget to download the deb
-VSCODE_DEPS="wget"
-UART_DEPS="minicom"
 
-# Build full list of dependencies
-DEPS="$GIT_DEPS $SDK_DEPS"
+if [[ "$INSTALL_DEPENDENCIES" == "STD" ]]; then
+    GIT_DEPS="git"
+    SDK_DEPS="cmake gcc-arm-none-eabi gcc g++"
+    OPENOCD_DEPS="gdb-multiarch automake autoconf build-essential texinfo libtool libftdi-dev libusb-1.0-0-dev"
+    # Wget to download the deb
+    VSCODE_DEPS="wget"
+    UART_DEPS="minicom"
 
-if [[ "$SKIP_OPENOCD" == 1 ]]; then
-    echo "Skipping OpenOCD (debug support)"
+    # Build full list of dependencies
+    DEPS="$GIT_DEPS $SDK_DEPS"
+
+    if [[ "$SKIP_OPENOCD" == 1 ]]; then
+        echo "Skipping OpenOCD (debug support)"
+    else
+        DEPS="$DEPS $OPENOCD_DEPS"
+    fi
+
+    if [[ "$SKIP_VSCODE" == 1 ]]; then
+        echo "Skipping VSCODE"
+    else
+        DEPS="$DEPS $VSCODE_DEPS"
+    fi
+
+    echo "Installing Dependencies"
+    sudo apt update
+    sudo apt install -y $DEPS
+
+elif [[ "$INSTALL_DEPENDENCIES" == "MINGW64" ]]; then
+
+    GIT_DEPS="git"
+    if command -v git > /dev/null; then
+        # GIT already there, maybe git-for-windows. Keep it!
+        GIT_DEPS=""
+    fi
+
+    # We need this to build the SDK and tools
+    SDK_DEPS="base-devel mingw-w64-x86_64-arm-none-eabi-toolchain mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja"
+    OPENOCD_DEPS="base-devel mingw-w64-x86_64-toolchain" # mingw-w64-x86_64-libusb
+
+    # Build full list of dependencies
+    DEPS="$GIT_DEPS $SDK_DEPS"
+
+    if [[ "$SKIP_OPENOCD" == 1 ]]; then
+        echo "Skipping OpenOCD (debug support)"
+    else
+        DEPS="$DEPS $OPENOCD_DEPS"
+    fi
+
+    echo "Installing Dependencies"
+    #pacman -Sy
+    pacman -S --needed $DEPS
+
+    # Workaround for openocd segfault with libusb 1.0.24-2
+    if [[ "$(pacman -Q mingw-w64-x86_64-libusb)" == "mingw-w64-x86_64-libusb 1.0.24-2" ]]; then
+        echo "Downgrade libusb to fix segfaults with openocd and picotool"
+        TEMP_DOWNLOAD="$(mktemp -d)"
+        if [[ -d "$TEMP_DOWNLOAD" ]]; then
+            wget -P "$TEMP_DOWNLOAD" http://repo.msys2.org/mingw/x86_64/mingw-w64-x86_64-libusb-1.0.23-1-any.pkg.tar.xz
+            pacman -U "$TEMP_DOWNLOAD/mingw-w64-x86_64-libusb-1.0.23-1-any.pkg.tar.xz"
+            rm "$TEMP_DOWNLOAD/mingw-w64-x86_64-libusb-1.0.23-1-any.pkg.tar.xz"
+            rmdir "$TEMP_DOWNLOAD"
+        fi
+    fi
+    
 else
-    DEPS="$DEPS $OPENOCD_DEPS"
+    echo "Unknown install system, dependencies need to be installed manually!"
 fi
-
-if [[ "$SKIP_VSCODE" == 1 ]]; then
-    echo "Skipping VSCODE"
-else
-    DEPS="$DEPS $VSCODE_DEPS"
-fi
-
-echo "Installing Dependencies"
-sudo apt update
-sudo apt install -y $DEPS
 
 echo "Creating $OUTDIR"
 # Create pico directory to put everything in
@@ -78,22 +134,42 @@ done
 
 cd $OUTDIR
 
+# On Windows cmake defaults to "NMake Makefiles" which will not work 
+if [[ "$MSYSTEM" == "MINGW64" ]]; then
+    GENERATOR="Ninja"
+    echo "Adding CMAKE_GENERATOR to ~/.bashrc"
+    echo "export CMAKE_GENERATOR=\"$GENERATOR\"" >> ~/.bashrc
+fi
+
 # Pick up new variables we just defined
 source ~/.bashrc
 
+# Adjust to choosen cmake generator
+if [[ "$CMAKE_GENERATOR" == "Ninja" ]]; then
+    BUILD_COMMAND="ninja"
+else
+    BUILD_COMMAND="make -j$JNUM"
+fi
+
 # Build a couple of examples
 cd "$OUTDIR/pico-examples"
-mkdir build
+mkdir -p build
 cd build
 cmake ../ -DCMAKE_BUILD_TYPE=Debug
 
-for e in blink hello_world
-do
-    echo "Building $e"
-    cd $e
-    make -j$JNUM
-    cd ..
-done
+if [[ "$CMAKE_GENERATOR" == "Ninja" ]]; then
+    echo "Building examples..."
+    # Note: Ninja is quite fast, we just build all examples...
+    ninja
+else 
+    for e in blink hello_world
+    do
+        echo "Building $e"
+        cd $e
+        $BUILD_COMMAND
+        cd ..
+    done
+fi
 
 cd $OUTDIR
 
@@ -102,18 +178,28 @@ for REPO in picoprobe picotool
 do
     DEST="$OUTDIR/$REPO"
     REPO_URL="${GITHUB_PREFIX}${REPO}${GITHUB_SUFFIX}"
-    git clone $REPO_URL
+    if [ -d $DEST ]; then
+        echo "$DEST already exists so skipping"
+    else
+        git clone $REPO_URL
+    fi
+
+    # Not 100% sure why this is needed...
+    if [[ "$REPO" == "picotool" ]] && [[ "$MSYSTEM" == "MINGW64" ]]; then
+        ADDITIONAL_CMAKE_ARGS="-DLIBUSB_INCLUDE_DIR=/mingw64/include/libusb-1.0"
+    fi
 
     # Build both
     cd $DEST
-    mkdir build
+    mkdir -p build
     cd build
-    cmake ../
-    make -j$JNUM
+    cmake ../ $ADDITIONAL_CMAKE_ARGS
+    $BUILD_COMMAND
 
     if [[ "$REPO" == "picotool" ]]; then
         echo "Installing picotool to /usr/local/bin/picotool"
-        sudo cp picotool /usr/local/bin/
+        $SUDO mkdir -p /usr/local/bin
+        $SUDO cp picotool /usr/local/bin/
     fi
 
     cd $OUTDIR
@@ -133,7 +219,10 @@ else
     # Should we include picoprobe support (which is a Pico acting as a debugger for another Pico)
     INCLUDE_PICOPROBE=1
     OPENOCD_BRANCH="rp2040"
-    OPENOCD_CONFIGURE_ARGS="--enable-ftdi --enable-sysfsgpio --enable-bcm2835gpio"
+    OPENOCD_CONFIGURE_ARGS="--enable-ftdi"
+    if [[ ! "$MSYSTEM" == "MINGW64" ]]; then
+        OPENOCD_CONFIGURE_ARGS="$OPENOCD_CONFIGURE_ARGS --enable-sysfsgpio --enable-bcm2835gpio"
+    fi
     if [[ "$INCLUDE_PICOPROBE" == 1 ]]; then
         OPENOCD_BRANCH="picoprobe"
         OPENOCD_CONFIGURE_ARGS="$OPENOCD_CONFIGURE_ARGS --enable-picoprobe"
@@ -144,7 +233,7 @@ else
     ./bootstrap
     ./configure $OPENOCD_CONFIGURE_ARGS
     make -j$JNUM
-    sudo make install
+    $SUDO make install
 fi
 
 cd $OUTDIR
